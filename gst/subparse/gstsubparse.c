@@ -33,6 +33,7 @@
 
 #include "gstsubparse.h"
 #include "gstssaparse.h"
+#include "gstzsassparse.h"
 #include "samiparse.h"
 #include "tmplayerparse.h"
 #include "mpl2parse.h"
@@ -2246,7 +2247,9 @@ plugin_init (GstPlugin * plugin)
   if (!gst_element_register (plugin, "subparse",
           GST_RANK_PRIMARY, GST_TYPE_SUBPARSE) ||
       !gst_element_register (plugin, "ssaparse",
-          GST_RANK_PRIMARY, GST_TYPE_SSA_PARSE)) {
+          GST_RANK_PRIMARY, GST_TYPE_SSA_PARSE) ||
+      !gst_element_register (plugin, "zsassparse",
+          GST_RANK_PRIMARY, GST_TYPE_ZS_ASS_PARSE)){
     return FALSE;
   }
 
