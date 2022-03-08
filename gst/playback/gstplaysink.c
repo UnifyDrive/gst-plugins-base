@@ -48,6 +48,10 @@ GST_DEBUG_CATEGORY_STATIC (gst_play_sink_debug);
 
 #define GST_PLAY_CHAIN(c) ((GstPlayChain *)(c))
 
+#define USE_ZS_SUBTITLE (TRUE)
+//#define USE_ZS_SUBTITLE (FALSE)
+
+
 /* enum types */
 /**
  * GstPlaySinkSendEventMode:
@@ -151,6 +155,7 @@ typedef struct
 {
   GstPlayChain chain;
   GstPad *sinkpad;
+  GstElement *video_queue;
   GstElement *queue;
   GstElement *identity;
   GstElement *overlay;
@@ -159,7 +164,20 @@ typedef struct
   GstPad *srcpad;               /* outgoing srcpad, used to connect to the next
                                  * chain */
   GstElement *sink;             /* custom sink to receive subtitle buffers */
+  GstElement *decoder_sub;             /* decode subtitle buffers */
+  GstElement *parser_sub;
+  GstPad *decoder_textsinkpad;
+  GstElement *sink_sub;         /* sink to receive subtitle buffers RGBA*/
+  gboolean need_parser_sub;
+  GstPad *subtitle_block_pad;
+  gulong subtitle_block_id;
+  gboolean subtitle_sink_blocked;
+  gboolean subtitle_flush;
+  GstCaps *subcaps;
+  gchar *sub_dec_type_running;             /*  subtitle decoder type */
 } GstPlayTextChain;
+
+#define GST_PLAY_TEXTCHAIN_CAST(obj)  ((GstPlayTextChain *) obj)
 
 #define GST_PLAY_SINK_GET_LOCK(playsink) (&((GstPlaySink *)playsink)->lock)
 #define GST_PLAY_SINK_LOCK(playsink)     G_STMT_START { \
@@ -289,6 +307,9 @@ struct _GstPlaySink
   gboolean text_custom_flush_finished;
   gboolean text_ignore_wrong_state;
   gboolean text_pending_flush;
+  gint video_width;
+  gint video_height;
+  gchar *sub_dec_type;             /*  subtitle decoder type */
 };
 
 struct _GstPlaySinkClass
@@ -357,6 +378,8 @@ enum
   LAST_SIGNAL
 };
 
+#define GST_PLAY_SINK_CAST(obj)  ((GstPlaySink *) obj)
+
 static void gst_play_sink_dispose (GObject * object);
 static void gst_play_sink_finalize (GObject * object);
 static void gst_play_sink_set_property (GObject * object, guint prop_id,
@@ -377,8 +400,9 @@ static void gst_play_sink_handle_message (GstBin * bin, GstMessage * message);
 
 /* sending audio/video flushes break stream changes when the pipeline
  * is paused and played again in 0.10 */
+
+static gboolean gst_play_sink_video_sink_event (GstPad * pad, GstObject * parent, GstEvent * event);
 #if 0
-static gboolean gst_play_sink_video_sink_event (GstPad * pad, GstEvent * event);
 static GstFlowReturn gst_play_sink_video_sink_chain (GstPad * pad,
     GstBuffer * buffer);
 static gboolean gst_play_sink_audio_sink_event (GstPad * pad, GstEvent * event);
@@ -736,6 +760,9 @@ gst_play_sink_init (GstPlaySink * playsink)
   playsink->colorbalance_channels =
       g_list_append (playsink->colorbalance_channels, channel);
   playsink->colorbalance_values[3] = 0;
+  playsink->video_width = 0;
+  playsink->video_height = 0;
+  playsink->sub_dec_type = NULL;
 }
 
 static void
@@ -853,6 +880,9 @@ gst_play_sink_dispose (GObject * object)
   g_list_free (playsink->colorbalance_channels);
   playsink->colorbalance_channels = NULL;
 
+  g_free (playsink->sub_dec_type);
+  playsink->sub_dec_type = NULL;
+
   G_OBJECT_CLASS (gst_play_sink_parent_class)->dispose (object);
 }
 
@@ -878,7 +908,7 @@ gst_play_sink_set_sink (GstPlaySink * playsink, GstPlaySinkType type,
   const gchar *sink_type = NULL;
 #endif
 
-  GST_LOG ("Setting sink %" GST_PTR_FORMAT " as sink type %d", sink, type);
+  //GST_ERROR ("Setting sink %" GST_PTR_FORMAT " as sink type %d", sink, type);
 
   GST_PLAY_SINK_LOCK (playsink);
   switch (type) {
@@ -1555,6 +1585,8 @@ gen_video_deinterlace_chain (GstPlaySink * playsink)
     chain->srcpad = gst_ghost_pad_new ("src", chain->sinkpad);
   }
 
+  /*gst_pad_set_event_function (chain->sinkpad,
+        GST_DEBUG_FUNCPTR (gst_play_sink_video_sink_event));*/
   gst_element_add_pad (chain->chain.bin, chain->sinkpad);
   gst_element_add_pad (chain->chain.bin, chain->srcpad);
 
@@ -2156,6 +2188,451 @@ setup_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
 }
 
 static gboolean
+zs_create_element (GstPlaySink * self, GstElement ** element,
+    const gchar * factory_name, GstElementFactory * factory,
+    const gchar * element_name, gboolean mandatory)
+{
+  GstElement *elt;
+
+  g_assert (!factory || !factory_name);
+
+  if (factory_name) {
+    elt = gst_element_factory_make (factory_name, element_name);
+  } else {
+    factory_name =
+        gst_plugin_feature_get_name (GST_PLUGIN_FEATURE_CAST (factory));
+    elt = gst_element_factory_create (factory, element_name);
+  }
+
+  if (G_UNLIKELY (!elt)) {
+    if (!factory) {
+      GstMessage *msg;
+
+      msg =
+          gst_missing_element_message_new (GST_ELEMENT_CAST (self),
+          factory_name);
+      gst_element_post_message (GST_ELEMENT_CAST (self), msg);
+
+      if (mandatory)
+        GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, (NULL),
+            ("no '%s' plugin found", factory_name));
+      else
+        GST_ELEMENT_WARNING (self, CORE, MISSING_PLUGIN, (NULL),
+            ("no '%s' plugin found", factory_name));
+    } else {
+      if (mandatory) {
+        GST_ELEMENT_ERROR (self, CORE, FAILED, (NULL),
+            ("can't instantiate '%s'", factory_name));
+      } else {
+        GST_ELEMENT_WARNING (self, CORE, FAILED, (NULL),
+            ("can't instantiate '%s'", factory_name));
+      }
+    }
+
+    return FALSE;
+  }
+
+  if (G_UNLIKELY (gst_element_set_state (elt,
+              GST_STATE_READY) != GST_STATE_CHANGE_SUCCESS)) {
+    gst_object_unref (elt);
+    if (mandatory) {
+      GST_ELEMENT_ERROR (self, CORE, STATE_CHANGE, (NULL),
+          ("failed to set '%s' to READY", factory_name));
+    } else {
+      GST_WARNING_OBJECT (self, "Failed to set '%s' to READY", factory_name);
+    }
+    return FALSE;
+  }
+
+  if (G_UNLIKELY (!gst_bin_add (GST_BIN_CAST (self), gst_object_ref (elt)))) {
+    gst_element_set_state (elt, GST_STATE_NULL);
+    gst_object_unref (elt);
+    if (mandatory) {
+      GST_ELEMENT_ERROR (self, CORE, FAILED, (NULL),
+          ("failed to add '%s' to subtitleoverlay", factory_name));
+    } else {
+      GST_WARNING_OBJECT (self, "Failed to add '%s' to subtitleoverlay",
+          factory_name);
+    }
+    return FALSE;
+  }
+
+  gst_element_sync_state_with_parent (elt);
+  *element = elt;
+  return TRUE;
+}
+
+static void
+zs_remove_element (GstElement * self, GstElement ** element)
+{
+  if (*element) {
+    gst_element_set_state (*element, GST_STATE_NULL);
+    gst_bin_remove (GST_BIN_CAST (self), *element);
+    //gst_object_unref (*element);
+    *element = NULL;
+  }
+}
+
+static gboolean
+zs_pad_supports_caps (GstPad * pad, GstCaps * caps)
+{
+  GstCaps *pad_caps;
+  gboolean ret = FALSE;
+
+  pad_caps = gst_pad_query_caps (pad, NULL);
+  if (gst_caps_is_subset (caps, pad_caps))
+    ret = TRUE;
+  gst_caps_unref (pad_caps);
+
+  return ret;
+}
+
+static GstPadProbeReturn
+zs_subtitle_pad_blocked_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data);
+
+static void
+zs_block_subtitle (GstPlaySink * playsink)
+{
+  GstPlayTextChain *self = playsink->textchain;
+  if (self->subtitle_block_id != 0)
+    return;
+
+  if (self->subtitle_block_pad) {
+    self->subtitle_block_id =
+        gst_pad_add_probe (self->subtitle_block_pad,
+        GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM, zs_subtitle_pad_blocked_cb, playsink, NULL);
+    GST_ERROR_OBJECT (self, "subtitle_block_id=%ld", self->subtitle_block_id);
+  }
+}
+
+static void
+zs_unblock_subtitle (GstPlaySink * playsink)
+{
+  GstPlayTextChain *self = playsink->textchain;
+  if (self->subtitle_block_id) {
+    gst_pad_remove_probe (self->subtitle_block_pad, self->subtitle_block_id);
+    self->subtitle_sink_blocked = FALSE;
+    self->subtitle_block_id = 0;
+  }
+}
+
+static GstPadProbeReturn
+zs_subtitle_pad_blocked_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (user_data);
+  GstPlayTextChain *self = playsink->textchain;
+  GstCaps *subcaps;
+  GList *l, *factories = NULL;
+
+  if (GST_IS_EVENT (info->data)) {
+    if (!GST_EVENT_IS_SERIALIZED (info->data)) {
+      GST_ERROR_OBJECT (pad, "Letting non-serialized event %s pass",
+          GST_EVENT_TYPE_NAME (info->data));
+      return GST_PAD_PROBE_PASS;
+    }
+    if (GST_EVENT_TYPE (info->data) == GST_EVENT_STREAM_START) {
+      GST_ERROR_OBJECT (pad, "Letting event %s pass",
+          GST_EVENT_TYPE_NAME (info->data));
+      return GST_PAD_PROBE_PASS;
+    }
+  }
+
+  GST_ERROR_OBJECT (pad, "Pad blocked");
+
+  GST_PLAY_SINK_LOCK (playsink);
+  if (pad == self->subtitle_block_pad)
+    self->subtitle_sink_blocked = TRUE;
+
+  /* Get current subtitle caps */
+  subcaps = self->subcaps;
+  GST_ERROR_OBJECT (self, "subcaps= %p", subcaps);
+  if (!subcaps && self->decoder_textsinkpad) {
+    GstPad *peer;
+
+    peer = gst_pad_get_peer (self->decoder_textsinkpad);
+    if (peer) {
+      subcaps = gst_pad_get_current_caps (peer);
+      if (!subcaps) {
+        subcaps = gst_pad_query_caps (peer, NULL);
+        if (!gst_caps_is_fixed (subcaps)) {
+          gst_caps_unref (subcaps);
+          subcaps = NULL;
+        }
+      }
+      gst_object_unref (peer);
+    }
+    gst_caps_replace (&self->subcaps, subcaps);
+    if (subcaps)
+      gst_caps_unref (subcaps);
+  }
+  GST_ERROR_OBJECT (self, "Current subtitle decoder caps: %" GST_PTR_FORMAT, subcaps);
+
+  
+  /* If there are no subcaps but the subtitle sink is blocked upstream
+   * must behave wrong as there are no fixed caps set for the first
+   * buffer or in-order event after stream-start */
+  if (G_UNLIKELY (!subcaps && self->subtitle_sink_blocked)) {
+    GST_ELEMENT_WARNING (self, CORE, NEGOTIATION, (NULL),
+        ("Subtitle sink is blocked but we have no subtitle caps"));
+    subcaps = NULL;
+  }
+
+  /* Now do something with the caps */
+  if (subcaps && !self->subtitle_flush) {
+    GstPad *target =
+        gst_ghost_pad_get_target (GST_GHOST_PAD_CAST (self->decoder_textsinkpad));
+
+    if (target && zs_pad_supports_caps (target, subcaps)) {
+      GST_ERROR_OBJECT (pad, "Target accepts caps");
+
+      gst_object_unref (target);
+
+      /* Unblock pads */
+      zs_unblock_subtitle (playsink);
+      goto out;
+    } else if (target) {
+      gst_object_unref (target);
+    }
+  }
+
+  self->subtitle_flush = FALSE;
+
+  GST_ERROR_OBJECT (self, "Everything worked, unblocking pads");
+  zs_unblock_subtitle (playsink);
+
+  
+out:
+  GST_PLAY_SINK_UNLOCK (playsink);
+
+  return GST_PAD_PROBE_OK;
+}
+
+static gboolean
+gst_play_sink_create_subparser (GstPad * pad, GstPlaySink *playsink, const gchar * parser_type)
+{
+    gboolean ret = TRUE;
+    GstElement *elem, *elem_dec, *linkend_elem;
+    GstCaps *caps = NULL;
+    GstPlayTextChain *chain = playsink->textchain;
+    GstBin *bin = GST_BIN_CAST (chain->chain.bin);
+
+    if (chain->decoder_sub) {
+        GST_DEBUG_OBJECT (playsink, "Subtitle pipeline is exist alread!");
+        linkend_elem = chain->decoder_sub;
+        if (chain->parser_sub) {
+            linkend_elem = chain->parser_sub;
+        }
+        gst_element_unlink_pads(chain->queue, "src", linkend_elem, "sink");
+        gst_element_set_state (chain->queue, GST_STATE_READY);
+        zs_remove_element(chain->chain.bin, &chain->parser_sub);
+        zs_remove_element(chain->chain.bin, &chain->decoder_sub);
+        zs_remove_element(chain->chain.bin, &chain->sink_sub);
+    }
+
+    chain->parser_sub = gst_element_factory_make (parser_type, "subtitleParser");
+    if (chain->parser_sub == NULL) {
+      post_missing_element_message (playsink, parser_type);
+      GST_ELEMENT_ERROR (playsink, CORE, MISSING_PLUGIN,
+          (_("Missing element '%s' - check your GStreamer installation."),
+              parser_type), (NULL));
+      ret = FALSE;
+      goto create_failed;
+    } else {
+      GST_DEBUG_OBJECT (playsink, "Create %s success, then add parser_sub to bin.", parser_type);
+      gst_bin_add (bin, chain->parser_sub);
+
+      if (gst_element_link_pads_full (chain->queue, "src", chain->parser_sub,
+                "sink", GST_PAD_LINK_CHECK_TEMPLATE_CAPS)) {
+        GST_DEBUG_OBJECT (playsink, "Link subtitle queue pad to subtitle parser %s pad success add set state to ready.", parser_type);
+        gst_element_set_state (chain->parser_sub, GST_STATE_READY);
+        g_object_set (chain->parser_sub, "video-fps", 25, 1, NULL);
+      } else {
+        GST_WARNING_OBJECT (playsink,
+              "can't link subtitle queue pad to subtitle parser %s pad!", parser_type);
+        ret = FALSE;
+        goto create_failed;
+      }
+    }
+
+    return ret;
+create_failed:
+    chain->need_parser_sub = FALSE;
+    if (chain->parser_sub && bin) {
+        gst_bin_remove (bin, chain->parser_sub);
+    }
+    chain->parser_sub = NULL;
+    return ret;
+}
+
+
+static gboolean
+gst_play_sink_link_decAndxsubtitlesink (GstPad * pad, GstPlaySink *playsink, const gchar * dec_type)
+{
+    gboolean ret = TRUE;
+    GstElement *elem, *elem_dec, *linkend_elem;
+    GstCaps *caps = NULL;
+    GstBaseSinkClass *bclass = NULL;
+    GstPlayTextChain *chain = playsink->textchain;
+    GstBin *bin = GST_BIN_CAST (chain->chain.bin);
+    gint64 w_tmp, h_tmp;
+    GstPad *textsinkpad = NULL;
+    gchar *element_name = NULL;
+
+    GST_DEBUG_OBJECT (playsink, "dec_type[%s].", dec_type);
+    if (chain->decoder_sub && chain->sink_sub) {
+        if (chain->sub_dec_type_running && strcmp(chain->sub_dec_type_running, dec_type) ==0 && chain->parser_sub == NULL) {
+            GST_DEBUG_OBJECT (playsink, "same subtitle decoder and sink are exist alread!");
+            playsink->text_pending_flush = FALSE;
+            playsink->text_ignore_wrong_state = FALSE;
+            return ret;
+        }else {
+            GST_DEBUG_OBJECT (playsink, "Not same subtitle decoder and sink are exist alread!");
+            linkend_elem = chain->decoder_sub;
+            if (chain->parser_sub) {
+                linkend_elem = chain->parser_sub;
+            }
+            gst_element_unlink_pads(chain->queue, "src", linkend_elem, "sink");
+            gst_element_set_state (chain->queue, GST_STATE_READY);
+            if (chain->parser_sub) {
+                gst_element_unlink_pads(chain->parser_sub, "src", chain->decoder_sub, "sink");
+                gst_element_set_state (chain->parser_sub, GST_STATE_READY);
+            }
+            gst_element_unlink_pads(chain->decoder_sub, "src", chain->sink_sub, "sink");
+            gst_element_set_state (chain->decoder_sub, GST_STATE_READY);
+            gst_element_set_state (chain->sink_sub, GST_STATE_READY);
+            zs_remove_element(chain->chain.bin, &chain->parser_sub);
+            zs_remove_element(chain->chain.bin, &chain->decoder_sub);
+            zs_remove_element(chain->chain.bin, &chain->sink_sub);
+            //return ret;
+        }
+    }
+
+    chain->sub_dec_type_running = g_strdup (dec_type);
+    chain->decoder_sub = gst_element_factory_make (dec_type, "subtitleDec");
+    if (chain->decoder_sub == NULL) {
+      post_missing_element_message (playsink, dec_type);
+      GST_ELEMENT_ERROR (playsink, CORE, MISSING_PLUGIN,
+          (_("Missing element '%s' - check your GStreamer installation."),
+              dec_type), (NULL));
+      ret = FALSE;
+      goto link_decAndxsubtitle_faild;
+    } else {
+      GST_DEBUG_OBJECT (playsink, "add decoder_sub to bin.");
+      gst_bin_add (bin, chain->decoder_sub);
+      chain->sink_sub = gst_element_factory_make ("xsubtitlesink", "subtitlesink");
+      if (chain->sink_sub == NULL) {
+        post_missing_element_message (playsink, "xsubtitlesink");
+        GST_ELEMENT_ERROR (playsink, CORE, MISSING_PLUGIN,
+            (_("Missing element '%s' - check your GStreamer installation."),
+                "xsubtitlesink"), (NULL));
+        ret = FALSE;
+        goto link_decAndxsubtitle_faild;
+      } else {
+        gst_bin_add (bin, chain->sink_sub);
+        if (chain->need_parser_sub) {
+            linkend_elem = chain->parser_sub;
+        } else {
+            linkend_elem = chain->queue;
+        }
+        element_name = gst_element_get_name(linkend_elem);
+        GST_DEBUG_OBJECT (playsink, "Now linked element is %s!", element_name);
+        if (element_name) {
+            g_free (element_name);
+        }
+        if (gst_element_link_pads_full (linkend_elem, "src", chain->decoder_sub,
+                "sink", GST_PAD_LINK_CHECK_TEMPLATE_CAPS)) {
+          /* we're all fine now and we can add the sink to the chain */
+          if (gst_element_link_pads_full (chain->decoder_sub, "src", chain->sink_sub,
+                "sink", GST_PAD_LINK_CHECK_TEMPLATE_CAPS)) {
+            gst_element_set_state (chain->decoder_sub, GST_STATE_READY);
+            gst_element_set_state (chain->sink_sub, GST_STATE_READY);
+            /* try to set sync to true but it's no biggie when we can't */
+            if (chain->sink_sub && (elem =
+                    gst_play_sink_find_property_sinks (playsink, chain->sink_sub,
+                        "sync", G_TYPE_BOOLEAN))) {
+                g_object_set (elem, "sync", TRUE, NULL);
+                g_object_set (elem, "plane-id", 115, NULL);
+                //g_object_set (elem, "plane-id", 129, NULL);//compressed
+                
+                caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "RGBA",
+                    "width", G_TYPE_INT, playsink->video_width,
+                    "height", G_TYPE_INT, playsink->video_height,
+                    "framerate", GST_TYPE_FRACTION, 30, 1, 
+                    "nv12-10le40", G_TYPE_INT, 0, 
+                    "multiview-mode", G_TYPE_STRING, "mono",
+                    "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
+                    "interlace-mode", G_TYPE_STRING, "progressive",
+                    NULL);
+                if (caps) {
+                    GST_DEBUG_OBJECT (playsink, "using xsubtitlesink to display and set caps!");
+                    bclass = GST_BASE_SINK_GET_CLASS (chain->sink_sub);
+                    if (bclass) {
+                        bclass->set_caps (chain->sink_sub, caps);
+                        if (chain->decoder_sub && (elem_dec =
+                            gst_play_sink_find_property_sinks (playsink, chain->decoder_sub,
+                                "surface-w", G_TYPE_INT))) {
+                                
+                                g_object_get(elem, "window-width", &w_tmp, "window-height", &h_tmp, NULL);
+                                GST_DEBUG_OBJECT (playsink, "using xsubtitlesink to display and set parameters surface-w [%ld, %ld] to %s!", w_tmp, h_tmp, dec_type);
+                                g_object_set (elem_dec, "surface-w", w_tmp, NULL);
+                                g_object_set (elem_dec, "surface-h", h_tmp, NULL);
+
+                                /*GstPad *proxypad = NULL;
+                                chain->decoder_textsinkpad = gst_element_get_static_pad (chain->decoder_sub, "sink");
+                                if (textsinkpad) {
+                                    GST_ERROR_OBJECT (playsink, "sinkpad have in decoder_sub!");
+                                    chain->decoder_textsinkpad = gst_ghost_pad_new ("may_block_sink", textsinkpad);
+                                    gst_object_unref (textsinkpad);
+                                }
+                                proxypad = GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD(chain->decoder_textsinkpad)));
+                                chain->subtitle_block_pad = chain->decoder_textsinkpad;//proxypad;
+                                gst_object_unref (proxypad);*/
+                        }
+                    }
+                    gst_caps_unref (caps);
+                }
+            }
+            
+          } else {
+              GST_WARNING_OBJECT (playsink,
+                  "can't link subtitle decoder pad to subtitle sink pad!");
+              ret = FALSE;
+              goto link_decAndxsubtitle_faild;
+          }
+        } else {
+          GST_WARNING_OBJECT (playsink,
+              "can't link subtitle queue pad to subtitle decoder pad!");
+          ret = FALSE;
+          goto link_decAndxsubtitle_faild;
+        }
+      }
+    }
+
+    return ret;
+link_decAndxsubtitle_faild:
+
+    if (chain->queue) {
+        gst_bin_remove (bin, chain->queue);
+    }
+    if (chain->decoder_sub) {
+        gst_bin_remove (bin, chain->decoder_sub);
+    }
+    if (chain->sink_sub) {
+        gst_bin_remove (bin, chain->sink_sub);
+    }
+    chain->queue = NULL;
+    chain->decoder_sub = NULL;
+    chain->sink_sub = NULL;
+    return ret;
+}
+
+static GstFlowReturn
+gst_play_sink_sink_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer,
+    const gchar * sink_type,
+    gboolean * sink_ignore_wrong_state,
+    gboolean * sink_custom_flush_finished, gboolean * sink_pending_flush);
+
+static gboolean
 gst_play_sink_sink_event (GstPad * pad, GstObject * parent, GstEvent * event,
     const gchar * sink_type,
     gboolean * sink_ignore_wrong_state,
@@ -2172,30 +2649,120 @@ gst_play_sink_sink_event (GstPad * pad, GstObject * parent, GstEvent * event,
     custom_flush = g_strdup_printf ("playsink-custom-%s-flush", sink_type);
     custom_flush_finish =
         g_strdup_printf ("playsink-custom-%s-flush-finish", sink_type);
-    if (strcmp (gst_structure_get_name (structure), custom_flush) == 0) {
+    if (strcmp (gst_structure_get_name (structure), custom_flush) == 0 /*&& strcmp(sink_type, "subtitle") != 0*/) {
       GST_DEBUG_OBJECT (pad,
           "Custom %s flush event received, marking to flush %s", sink_type,
           sink_type);
       GST_PLAY_SINK_LOCK (playsink);
       *sink_ignore_wrong_state = TRUE;
       *sink_custom_flush_finished = FALSE;
+      
+      //playsink->textchain->subtitle_flush = TRUE;
+      //zs_block_subtitle (playsink);
+      
       GST_PLAY_SINK_UNLOCK (playsink);
     } else if (strcmp (gst_structure_get_name (structure),
-            custom_flush_finish) == 0) {
+            custom_flush_finish) == 0 /*&& strcmp(sink_type, "subtitle") != 0*/) {
       GST_DEBUG_OBJECT (pad, "Custom %s flush finish event received",
           sink_type);
       GST_PLAY_SINK_LOCK (playsink);
       *sink_pending_flush = TRUE;
       *sink_custom_flush_finished = TRUE;
       GST_PLAY_SINK_UNLOCK (playsink);
+
+      if (playsink->textchain->parser_sub) {
+          gst_play_sink_sink_chain (pad, parent, NULL, "subtitle",
+            &playsink->text_ignore_wrong_state,
+            &playsink->text_custom_flush_finished, &playsink->text_pending_flush);
+      }
     }
 
     g_free (custom_flush);
     g_free (custom_flush_finish);
+  }else if (GST_EVENT_TYPE (event) == GST_EVENT_CAPS && structure && USE_ZS_SUBTITLE) {
+    gchar * caps_value = gst_structure_to_string(structure);
+    GST_DEBUG_OBJECT (pad, "structure name [%s]", gst_structure_get_name(structure));
+    GST_PLAY_SINK_LOCK (playsink);
+    playsink->textchain->need_parser_sub = FALSE;
+    if (strstr(caps_value, "pgs")) {
+        if (playsink->video_width > 0 && playsink->video_height > 0) {
+            ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_pgssub");
+            g_free (playsink->sub_dec_type);
+            playsink->sub_dec_type = NULL;
+        }else {
+            playsink->sub_dec_type = g_strdup ("avdec_pgssub");
+        }
+    }else if (strstr(caps_value, "text/x-raw")) {
+        if (playsink->video_width > 0 && playsink->video_height > 0) {
+            ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_subrip");
+            g_free (playsink->sub_dec_type);
+            playsink->sub_dec_type = NULL;
+        }else {
+            playsink->sub_dec_type = g_strdup ("avdec_subrip");
+        }
+    }else if (strstr(caps_value, "application/x-ssa")) {
+        if (strstr(caps_value, "parsed") && strstr(caps_value, "false")) {
+            playsink->textchain->need_parser_sub = TRUE;
+            gst_play_sink_create_subparser(pad, playsink, "zsassparse");
+            if (playsink->video_width > 0 && playsink->video_height > 0) {
+                ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_subrip");
+                g_free (playsink->sub_dec_type);
+                playsink->sub_dec_type = NULL;
+            }else {
+                playsink->sub_dec_type = g_strdup ("avdec_subrip");
+            }
+        }else {
+            if (playsink->video_width > 0 && playsink->video_height > 0) {
+                ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_ssa");
+                g_free (playsink->sub_dec_type);
+                playsink->sub_dec_type = NULL;
+            }else {
+                playsink->sub_dec_type = g_strdup ("avdec_ssa");
+            }
+        }
+    }else if (strstr(caps_value, "application/x-ass")) {
+        if (strstr(caps_value, "parsed") && strstr(caps_value, "false")) {
+            playsink->textchain->need_parser_sub = TRUE;
+            gst_play_sink_create_subparser(pad, playsink, "zsassparse");
+            if (playsink->video_width > 0 && playsink->video_height > 0) {
+                ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_subrip");
+                g_free (playsink->sub_dec_type);
+                playsink->sub_dec_type = NULL;
+            }else {
+                playsink->sub_dec_type = g_strdup ("avdec_subrip");
+            }
+        }else {
+            if (playsink->video_width > 0 && playsink->video_height > 0) {
+                ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_ass");
+                g_free (playsink->sub_dec_type);
+                playsink->sub_dec_type = NULL;
+            }else {
+                playsink->sub_dec_type = g_strdup ("avdec_ass");
+            }
+        }
+    }else if (strstr(caps_value, "application/x-subtitle")) {
+        playsink->textchain->need_parser_sub = TRUE;
+        gst_play_sink_create_subparser(pad, playsink, "subparse");
+        if (playsink->video_width > 0 && playsink->video_height > 0) {
+            ret = gst_play_sink_link_decAndxsubtitlesink(pad, playsink, "avdec_subrip");
+            g_free (playsink->sub_dec_type);
+            playsink->sub_dec_type = NULL;
+        }else {
+            playsink->sub_dec_type = g_strdup ("avdec_subrip");
+        }
+    }
+    GST_PLAY_SINK_UNLOCK (playsink);
+    GST_DEBUG_OBJECT (pad, "structure name over [%s], Forwarding event %" GST_PTR_FORMAT, gst_structure_get_name(structure), event);
   }
 
   GST_DEBUG_OBJECT (pad, "Forwarding event %" GST_PTR_FORMAT, event);
   ret = gst_pad_event_default (pad, parent, gst_event_ref (event));
+  if (GST_EVENT_TYPE (event) == GST_EVENT_SEGMENT) {
+    const GstSegment *segment;
+    gst_event_parse_segment (event, &segment);
+    gst_pad_event_default (pad, parent, gst_event_new_gap (segment->start, 0 * GST_SECOND));//can not play problem after seeking for bluray 
+    GST_DEBUG_OBJECT (pad, "Forwarding event gap ........");
+  }
 
   gst_event_unref (event);
   gst_object_unref (playsink);
@@ -2267,11 +2834,21 @@ gst_play_sink_sink_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer,
       gst_pad_send_event (pad, event);
       gst_event_unref (segment_event);
     }
+    gst_element_sync_state_with_parent (tbin);
   } else {
     GST_PLAY_SINK_UNLOCK (playsink);
   }
 
+  if (buffer == NULL) {
+    GST_WARNING_OBJECT (pad, " buffer is NULL and goto direct_out !!!");
+    goto direct_out;
+  }
+
   ret = gst_proxy_pad_chain_default (pad, parent, buffer);
+  GST_DEBUG_OBJECT (pad, " gst_proxy_pad_chain_default() return [%d] for %s !", ret, sink_type);
+  GST_WARNING_OBJECT (pad, "Have buffer of size %" G_GSIZE_FORMAT ", ts %"
+      GST_TIME_FORMAT ", dur %" G_GINT64_FORMAT, gst_buffer_get_size (buffer),
+      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buffer)), GST_BUFFER_DURATION (buffer));
 
   GST_PLAY_SINK_LOCK (playsink);
   if (ret == GST_FLOW_FLUSHING && *sink_ignore_wrong_state) {
@@ -2282,11 +2859,27 @@ gst_play_sink_sink_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer,
           "wrong state for %s", sink_type);
       *sink_ignore_wrong_state = FALSE;
     }
-
+    GST_PLAY_SINK_UNLOCK (playsink);
+    //gst_element_sync_state_with_parent (tbin);//delete on 2022-03-08. avoid locked problem after seek
     ret = GST_FLOW_OK;
+  }else if (ret != GST_FLOW_OK) {
+    GST_PLAY_SINK_UNLOCK (playsink);
+    GST_ERROR_OBJECT (pad, " gst_proxy_pad_chain_default() failed[%d] for %s !!!", ret, sink_type);
+    if (strcmp(sink_type, "subtitle") == 0 && ret == GST_FLOW_NOT_LINKED) {
+        //GST_ERROR_OBJECT (pad, " gst_proxy_pad_chain_default() failed not linked and sleep !");
+    }else if (strcmp(sink_type, "subtitle") == 0 && ret == GST_FLOW_FLUSHING) {
+        
+        //GstState current, pending;
+        //gst_element_get_state (GST_ELEMENT (tbin), &current, &pending, GST_CLOCK_TIME_NONE);
+        //GST_ERROR_OBJECT (pad, " gst_proxy_pad_chain_default() failed is flushing flow, current state=%d, pending state=%d !", current, pending);
+    }
+    ret = GST_FLOW_OK;
+  }else {
+    GST_PLAY_SINK_UNLOCK (playsink);
   }
-  GST_PLAY_SINK_UNLOCK (playsink);
 
+  GST_WARNING_OBJECT (pad, " go_out !!!");
+direct_out:
   gst_object_unref (playsink);
   gst_object_unref (tbin);
   return ret;
@@ -2294,24 +2887,77 @@ gst_play_sink_sink_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer,
 
 /* sending audio/video flushes break stream changes when the pipeline
  * is paused and played again in 0.10 */
-#if 0
 static gboolean
-gst_play_sink_video_sink_event (GstPad * pad, GstEvent * event)
+gst_play_sink_sink_event2 (GstPad * pad, GstObject * parent, GstEvent * event,
+    const gchar * sink_type)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_object_get_parent (parent));
+  gboolean ret = TRUE;
+  const GstStructure *structure = gst_event_get_structure (event);
+  GstVideoInfo info;
+  GstCaps *caps;
+  
+  if (GST_EVENT_TYPE (event) == GST_EVENT_CAPS && structure) {
+    //gchar * caps_value = gst_structure_to_string(structure);
+    //GST_ERROR_OBJECT (pad, "structure name [%s] value[%s]", gst_structure_get_name(structure), caps_value);
+    gst_event_parse_caps(event, &caps);
+    
+    GST_PLAY_SINK_LOCK (playsink);
+    if (gst_video_info_from_caps (&info, caps)) {
+        playsink->video_width = info.width;
+        playsink->video_height = info.height;
+    }
+    if (playsink->sub_dec_type) {
+        ret = gst_play_sink_link_decAndxsubtitlesink(NULL, playsink, playsink->sub_dec_type);
+        g_free (playsink->sub_dec_type);
+        playsink->sub_dec_type = NULL;
+    }
+    GST_PLAY_SINK_UNLOCK (playsink);
+    GST_DEBUG_OBJECT (pad, "structure name over [%s] caps pointer[%p] w:h[%d, %d]", 
+        gst_structure_get_name(structure), caps, playsink->video_width, playsink->video_height);
+    //GST_ERROR_OBJECT (pad, "Forwarding event %" GST_PTR_FORMAT, event);
+
+    if (0) {
+        GstEvent *seek;
+        GstSeekFlags seek_flags = GST_SEEK_FLAG_FLUSH;
+        gboolean res = TRUE;
+
+        seek = gst_event_new_seek (1.0, GST_FORMAT_TIME,
+            seek_flags | GST_SEEK_FLAG_ACCURATE,
+            /* start */ GST_SEEK_TYPE_SET, 0,
+            /* stop */ GST_SEEK_TYPE_SET, GST_CLOCK_TIME_NONE);
+        res = gst_element_send_event ((GstElement *)(&playsink->bin), seek);
+        if (res) {
+          GST_DEBUG_OBJECT (playsink, "Sent event successfully to text xsubtitlesink");
+        } else {
+          GST_DEBUG_OBJECT (playsink, "Event failed when sent to text xsubtitlesink");
+        }
+    }
+  }
+
+  ret = gst_pad_event_default (pad, parent, gst_event_ref (event));
+
+  gst_event_unref (event);
+  gst_object_unref (playsink);
+  return ret;
+}
+
+
+static gboolean
+gst_play_sink_video_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 {
   GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
   GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
   gboolean ret;
 
-  ret = gst_play_sink_sink_event (pad, event, "video",
-      &playsink->video_ignore_wrong_state,
-      &playsink->video_custom_flush_finished,
-      &playsink->video_pending_flush, &playsink->video_segment);
+  ret = gst_play_sink_sink_event2 (pad, parent, event, "video");
 
   gst_object_unref (playsink);
   gst_object_unref (tbin);
   return ret;
 }
 
+#if 0
 static GstFlowReturn
 gst_play_sink_video_sink_chain (GstPad * pad, GstBuffer * buffer)
 {
@@ -2365,12 +3011,58 @@ gst_play_sink_audio_sink_chain (GstPad * pad, GstBuffer * buffer)
 #endif
 
 static gboolean
+gst_play_sink_text_sink_query (GstPad * pad, GstObject * parent,
+    GstQuery * query)
+{
+  gboolean ret = FALSE;
+
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_ACCEPT_CAPS:
+    {
+      GstCaps *caps, *allowed;
+      
+      gst_query_parse_accept_caps (query, &caps);
+      GST_DEBUG_OBJECT (pad, "Checking if requested caps %" GST_PTR_FORMAT, caps);
+      gst_query_set_accept_caps_result (query, TRUE);
+      ret = TRUE;
+      break;
+    }
+    case GST_QUERY_CAPS:
+    {
+      GstCaps *filter, *caps, *retcap;
+
+      GST_DEBUG_OBJECT (pad, "Pad query GST_QUERY_CAPS !!!");
+      gst_query_parse_caps (query, &filter);
+      //caps = gst_subtitle_overlay_subtitle_sink_getcaps (pad, filter);
+      caps = gst_subtitle_overlay_create_factory_caps ();
+      if (filter) {
+        retcap = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
+        gst_caps_unref (caps);
+      } else {
+        retcap = caps;
+      }
+      gst_query_set_caps_result (query, retcap);
+      gst_caps_unref (retcap);
+      ret = TRUE;
+      break;
+    }
+    default:
+      GST_DEBUG_OBJECT (pad, "Pad query default !!!");
+      ret = gst_pad_query_default (pad, parent, query);
+      break;
+  }
+
+  return ret;
+}
+
+static gboolean
 gst_play_sink_text_sink_event (GstPad * pad, GstObject * parent,
     GstEvent * event)
 {
   GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_object_get_parent (parent));
   gboolean ret;
 
+  //GST_DEBUG_OBJECT (playsink, "text event!");
   ret = gst_play_sink_sink_event (pad, parent, event, "subtitle",
       &playsink->text_ignore_wrong_state,
       &playsink->text_custom_flush_finished, &playsink->text_pending_flush);
@@ -2387,6 +3079,7 @@ gst_play_sink_text_sink_chain (GstPad * pad, GstObject * parent,
   gboolean ret;
   GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_object_get_parent (parent));
 
+  GST_DEBUG_OBJECT (playsink, "text sink chain!");
   ret = gst_play_sink_sink_chain (pad, parent, buffer, "subtitle",
       &playsink->text_ignore_wrong_state,
       &playsink->text_custom_flush_finished, &playsink->text_pending_flush);
@@ -2402,7 +3095,7 @@ gst_play_sink_text_src_event (GstPad * pad, GstObject * parent,
   gboolean ret;
   const GstStructure *structure;
 
-  GST_DEBUG_OBJECT (pad, "Got event %" GST_PTR_FORMAT, event);
+  //GST_DEBUG_OBJECT (pad, "Got event %" GST_PTR_FORMAT, event);
 
   structure = gst_event_get_structure (event);
 
@@ -2445,7 +3138,8 @@ gen_text_chain (GstPlaySink * playsink)
   GstPlayTextChain *chain;
   GstBin *bin;
   GstElement *elem;
-  GstPad *videosinkpad, *textsinkpad, *srcpad;
+  GstPad *videosinkpad, *textsinkpad, *srcpad, *subdecsrcpad, *subsinksinkpad;
+  
 
   chain = g_new0 (GstPlayTextChain, 1);
   chain->chain.playsink = playsink;
@@ -2456,7 +3150,7 @@ gen_text_chain (GstPlaySink * playsink)
   bin = GST_BIN_CAST (chain->chain.bin);
   gst_object_ref_sink (bin);
 
-  videosinkpad = textsinkpad = srcpad = NULL;
+  videosinkpad = textsinkpad = srcpad = subdecsrcpad = subsinksinkpad = NULL;
 
   /* first try to hook the text pad to the custom sink */
   if (playsink->text_sink) {
@@ -2519,9 +3213,11 @@ gen_text_chain (GstPlaySink * playsink)
     }
   }
 
-  if (textsinkpad == NULL) {
+  if (!USE_ZS_SUBTITLE && textsinkpad == NULL) {
+    GST_DEBUG_OBJECT (playsink, "textsinkpad == NULL");
     if (!(playsink->flags & GST_PLAY_FLAG_NATIVE_VIDEO)) {
       /* make a little queue */
+    GST_ERROR_OBJECT (playsink, "make vqueue!");
       chain->queue = gst_element_factory_make ("queue", "vqueue");
       if (chain->queue == NULL) {
         post_missing_element_message (playsink, "queue");
@@ -2590,6 +3286,30 @@ gen_text_chain (GstPlaySink * playsink)
     }
   }
 
+  GST_DEBUG_OBJECT (playsink, "playsink->font_desc= %s", playsink->font_desc);
+  GST_DEBUG_OBJECT (playsink, "playsink->subtitle_encoding= %s", playsink->subtitle_encoding);
+
+  if (videosinkpad == NULL) {
+    if (!(playsink->flags & GST_PLAY_FLAG_NATIVE_VIDEO)) {
+        /* make a little queue */
+        chain->video_queue = gst_element_factory_make ("queue", "vqueue");
+        if (chain->video_queue == NULL) {
+          post_missing_element_message (playsink, "queue");
+          GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
+              (_("Missing element '%s' - check your GStreamer installation."),
+                  "queue"), ("video rendering might be suboptimal"));
+        } else {
+          g_object_set (G_OBJECT (chain->video_queue), "max-size-buffers", 3,
+              "max-size-bytes", 0, "max-size-time", (gint64) 0,
+              "silent", TRUE, NULL);
+          gst_bin_add (bin, chain->video_queue);
+          srcpad = gst_element_get_static_pad (chain->video_queue, "src");
+          videosinkpad = gst_element_get_static_pad (chain->video_queue, "sink");
+          gst_element_set_state (chain->video_queue, GST_STATE_READY);
+        }
+    }
+  }
+
   if (videosinkpad == NULL) {
     /* if we still don't have a videosink, we don't have an overlay. the only
      * thing we can do is insert an identity and ghost the src
@@ -2606,16 +3326,23 @@ gen_text_chain (GstPlaySink * playsink)
       gst_bin_add (bin, chain->identity);
       srcpad = gst_element_get_static_pad (chain->identity, "src");
       videosinkpad = gst_element_get_static_pad (chain->identity, "sink");
+      gst_element_set_state (chain->identity, GST_STATE_READY);
     }
   }
 
   /* expose the ghostpads */
   if (videosinkpad) {
+    GST_DEBUG_OBJECT (playsink, "videosinkpad have!");
     chain->videosinkpad = gst_ghost_pad_new ("sink", videosinkpad);
     gst_object_unref (videosinkpad);
+    if (USE_ZS_SUBTITLE) {
+        gst_pad_set_event_function (chain->videosinkpad,
+            GST_DEBUG_FUNCPTR (gst_play_sink_video_sink_event));
+    }
     gst_element_add_pad (chain->chain.bin, chain->videosinkpad);
   }
   if (textsinkpad) {
+    GST_DEBUG_OBJECT (playsink, "textsinkpad have!");
     chain->textsinkpad = gst_ghost_pad_new ("text_sink", textsinkpad);
     gst_object_unref (textsinkpad);
 
@@ -2625,8 +3352,44 @@ gen_text_chain (GstPlaySink * playsink)
         GST_DEBUG_FUNCPTR (gst_play_sink_text_sink_chain));
 
     gst_element_add_pad (chain->chain.bin, chain->textsinkpad);
+  } else {//use avcodec_subdec and xsubtitlesink 
+    
+    chain->queue = gst_element_factory_make ("queue", "subqueue");
+    if (chain->queue == NULL) {
+      post_missing_element_message (playsink, "queue");
+      GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
+          (_("Missing element '%s' - check your GStreamer installation."),
+              "queue"), ("rendering might be suboptimal"));
+    } else {
+      g_object_set (G_OBJECT (chain->queue), "max-size-buffers", 3,
+          "max-size-bytes", 0, "max-size-time", (gint64) GST_SECOND,
+          "silent", TRUE, NULL);
+      gst_bin_add (bin, chain->queue);
+      //gst_element_set_state (chain->queue, GST_STATE_READY);
+    }
+
+    textsinkpad = gst_element_get_static_pad (chain->queue, "sink");
+    if (textsinkpad) {
+        GST_DEBUG_OBJECT (playsink, "textsinkpad have in xsubtitlesink!");
+        chain->textsinkpad = gst_ghost_pad_new ("text_sink", textsinkpad);
+        gst_object_unref (textsinkpad);
+
+        gst_pad_set_event_function (chain->textsinkpad,
+            GST_DEBUG_FUNCPTR (gst_play_sink_text_sink_event));
+        gst_pad_set_chain_function (chain->textsinkpad,
+            GST_DEBUG_FUNCPTR (gst_play_sink_text_sink_chain));
+        gst_pad_set_query_function (chain->textsinkpad,
+            GST_DEBUG_FUNCPTR (gst_play_sink_text_sink_query));
+
+        gst_element_add_pad (chain->chain.bin, chain->textsinkpad);
+    }
+    chain->need_parser_sub = FALSE;
+    chain->parser_sub = NULL;
   }
+
+
   if (srcpad) {
+    GST_DEBUG_OBJECT (playsink, "srcpad have!");
     chain->srcpad = gst_ghost_pad_new ("src", srcpad);
     gst_object_unref (srcpad);
 
@@ -2636,6 +3399,7 @@ gen_text_chain (GstPlaySink * playsink)
     gst_element_add_pad (chain->chain.bin, chain->srcpad);
   }
 
+  GST_DEBUG_OBJECT (playsink, "make text chain %p over", chain);
   return chain;
 }
 
@@ -4802,6 +5566,16 @@ gst_play_sink_send_event_to_sink (GstPlaySink * playsink, GstEvent * event,
       } else {
         GST_DEBUG_OBJECT (playsink, "Event failed when sent to text sink");
       }
+    }else if (playsink->textchain && playsink->textchain->sink_sub) {
+      gst_event_ref (event);
+      do {
+        res = gst_element_send_event (playsink->textchain->chain.bin, event);
+        if (res) {
+          GST_DEBUG_OBJECT (playsink, "Sent event successfully to text xsubtitlesink");
+        } else {
+          GST_DEBUG_OBJECT (playsink, "Event failed when sent to text xsubtitlesink");
+        }
+      }while (0);
     }
 
     if (playsink->videochain) {
@@ -4811,9 +5585,11 @@ gst_play_sink_send_event_to_sink (GstPlaySink * playsink, GstEvent * event,
                   event))) {
         GST_DEBUG_OBJECT (playsink, "Sent event successfully to video sink");
         goto done;
+      } else {
+        GST_DEBUG_OBJECT (playsink, "Event failed when sent to video sink");
       }
-      GST_DEBUG_OBJECT (playsink, "Event failed when sent to video sink");
     }
+
     if (!force_video && playsink->audiochain) {
       gst_event_ref (event);
       if ((res =
@@ -4849,7 +5625,7 @@ gst_play_sink_send_event (GstElement * element, GstEvent * event)
   playsink = GST_PLAY_SINK_CAST (element);
   switch (event_type) {
     case GST_EVENT_SEEK:
-      GST_DEBUG_OBJECT (element, "Sending event to a sink");
+      GST_DEBUG_OBJECT (element, "Sending seek event to a sink");
       res = gst_play_sink_send_event_to_sink (playsink, event, FALSE);
       break;
     case GST_EVENT_STEP:
@@ -4858,6 +5634,7 @@ gst_play_sink_send_event (GstElement * element, GstEvent * event)
       guint64 amount;
       gdouble rate;
       gboolean flush, intermediate;
+      GST_DEBUG_OBJECT (element, "Sending GST_EVENT_STEP event to a sink");
       gst_event_parse_step (event, &format, &amount, &rate, &flush,
           &intermediate);
       if (format == GST_FORMAT_BUFFERS) {
@@ -5319,6 +6096,7 @@ gst_play_sink_overlay_set_render_rectangle (GstVideoOverlay * overlay, gint x,
   playsink->overlay_y = y;
   playsink->overlay_width = width;
   playsink->overlay_height = height;
+  GST_ERROR_OBJECT (playsink, "####################################[%d, %d][%d, %d] !", x, y, width, height);
 
   if (overlay_element) {
     gst_video_overlay_set_render_rectangle (overlay_element, x, y, width,
